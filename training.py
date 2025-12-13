@@ -25,7 +25,7 @@ from pathlib import Path
 from dataclasses import dataclass
 
 import sys
-from models.time_rcd.ts_encoder_bi_bias import TimeSeriesEncoder
+from models.time_rcd.ts_encoder_mamba import TimeSeriesEncoderMamba as TimeSeriesEncoder
 from models.time_rcd.time_rcd_config import TimeRCDConfig, default_config
 
 import warnings
