@@ -5,25 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from einops import rearrange
-
-
-try:
-    from mamba_ssm import Mamba
-
-    print("✅ 使用官方 mamba_ssm (CUDA 加速)")
-except ImportError:
-    try:
-        from mamba_min.mamba import Mamba
-
-        print("⚠️  使用 mamba-min (纯 PyTorch，速度较慢)")
-    except ImportError:
-        raise ImportError(
-            "请安装 mamba_ssm 或 mamba-min:\n"
-            "pip install mamba-ssm\n"
-            "# 或\n"
-            "pip install git+https://github.com/kyegomez/mamba-min"
-        )
-
+from mamba_ssm import Mamba
 
 class RMSNorm(nn.Module):
     """Root Mean Square Normalization"""
@@ -91,6 +73,7 @@ class TimeSeriesEncoderMamba(nn.Module):
             d_proj: int = 256,
             patch_size: int = 4,
             num_layers: int = 8,
+            num_heads: int = 8,
             d_ff_dropout: float = 0.1,
             max_total_tokens: int = 8192,  # 保留参数，Mamba 不依赖此值
             use_rope: bool = True,  # 保留参数，Mamba 不使用 RoPE
