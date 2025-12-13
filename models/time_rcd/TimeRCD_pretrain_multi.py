@@ -15,7 +15,7 @@ from typing import Tuple, List, Dict, Any, Union, Optional
 from dataclasses import dataclass
 
 from .dataset import ChatTSTimeRCDPretrainDataset
-from .ts_encoder_bi_bias import TimeSeriesEncoder
+from models.time_rcd.ts_encoder_mamba import TimeSeriesEncoderMamba as TimeSeriesEncoder
 from .time_rcd_config import TimeRCDConfig, default_config
 
 import warnings
