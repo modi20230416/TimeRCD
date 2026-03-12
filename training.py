@@ -25,7 +25,7 @@ from pathlib import Path
 from dataclasses import dataclass
 
 import sys
-from .ts_encoder_bi_bias import TimeSeriesEncoder
+from models.time_rcd.ts_encoder_bi_bias import TimeSeriesEncoder
 from models.time_rcd.time_rcd_config import TimeRCDConfig, default_config
 
 import warnings
@@ -220,6 +220,98 @@ def create_random_mask(time_series: torch.Tensor,  #(B, max_seq_len, num_feature
     return masked_time_series, mask  # (B, max_seq_len, num_features), (B, max_seq_len)
 
 
+def _normalize_multiscale_config(config: TimeRCDConfig) -> Tuple[Tuple[int, ...], str, str]:
+    """Validate and normalize multi-scale training config."""
+    scales = tuple(int(scale) for scale in getattr(config, 'multiscale_scales', (1, 2, 4)))
+    if len(scales) == 0:
+        raise ValueError("multiscale_scales must not be empty")
+    if any(scale <= 0 for scale in scales):
+        raise ValueError("all multiscale_scales must be positive integers")
+
+    downsample_method = str(getattr(config, 'multiscale_downsample_method', 'avg')).lower()
+    if downsample_method not in {"avg", "stride"}:
+        raise ValueError("multiscale_downsample_method must be either 'avg' or 'stride'")
+
+    fusion = str(getattr(config, 'multiscale_fusion', 'mean')).lower()
+    if fusion not in {"mean", "max"}:
+        raise ValueError("multiscale_fusion must be either 'mean' or 'max'")
+
+    return scales, downsample_method, fusion
+
+
+def _downsample_batch_for_multiscale(
+        time_series: torch.Tensor,
+        masked_time_series: torch.Tensor,
+        labels: torch.Tensor,
+        attention_mask: torch.Tensor,
+        mask: torch.Tensor,
+        scale: int,
+        method: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Downsample a training/eval batch for multi-scale anomaly supervision."""
+    if scale <= 1:
+        return time_series, masked_time_series, labels, attention_mask, mask
+
+    if method == "stride":
+        return (
+            time_series[:, ::scale, :],
+            masked_time_series[:, ::scale, :],
+            labels[:, ::scale],
+            attention_mask[:, ::scale],
+            mask[:, ::scale],
+        )
+
+    # avg pooling over non-overlapping windows on time axis
+    batch_size, seq_len, num_features = time_series.shape
+    trim_len = (seq_len // scale) * scale
+    if trim_len == 0:
+        return time_series, masked_time_series, labels, attention_mask, mask
+
+    ts_trim = time_series[:, :trim_len, :].view(batch_size, trim_len // scale, scale, num_features)
+    mts_trim = masked_time_series[:, :trim_len, :].view(batch_size, trim_len // scale, scale, num_features)
+    labels_trim = labels[:, :trim_len].view(batch_size, trim_len // scale, scale)
+    attn_trim = attention_mask[:, :trim_len].view(batch_size, trim_len // scale, scale)
+    mask_trim = mask[:, :trim_len].view(batch_size, trim_len // scale, scale)
+
+    scaled_time_series = ts_trim.mean(dim=2)
+    scaled_masked_time_series = mts_trim.mean(dim=2)
+    # Preserve anomaly signal if any timestep in the segment is anomalous
+    scaled_labels = labels_trim.max(dim=2).values
+    # Valid only when all points are valid (avoid introducing padded artifacts)
+    scaled_attention_mask = attn_trim.all(dim=2)
+    # Keep masked supervision if any position in segment was masked
+    scaled_mask = mask_trim.bool().any(dim=2)
+
+    return scaled_time_series, scaled_masked_time_series, scaled_labels, scaled_attention_mask, scaled_mask
+
+
+def _multiscale_anomaly_loss(
+        model: nn.Module,
+        masked_time_series: torch.Tensor,
+        labels: torch.Tensor,
+        attention_mask: torch.Tensor,
+        mask: torch.Tensor,
+        config: TimeRCDConfig) -> torch.Tensor:
+    """Compute fused multi-scale anomaly detection loss."""
+    scales, downsample_method, fusion = _normalize_multiscale_config(config)
+    anomaly_losses = []
+    for scale in scales:
+        _, scaled_masked_ts, scaled_labels, scaled_attention, scaled_mask = _downsample_batch_for_multiscale(
+            time_series=masked_time_series,
+            masked_time_series=masked_time_series,
+            labels=labels,
+            attention_mask=attention_mask,
+            mask=mask,
+            scale=scale,
+            method=downsample_method,
+        )
+        local_embeddings_scale = model(scaled_masked_ts, scaled_attention & (~scaled_mask.bool()))
+        anomaly_loss_scale = model.module.anomaly_detection_loss(local_embeddings_scale, scaled_labels)
+        anomaly_losses.append(anomaly_loss_scale)
+
+    losses_stack = torch.stack(anomaly_losses)
+    return losses_stack.max() if fusion == "max" else losses_stack.mean()
+
+
 def collate_fn(batch):
     """Collate function for pretraining dataset."""
     time_series_list, normal_time_series_list, labels_list, attribute_list = zip(*batch)
@@ -342,7 +434,17 @@ def evaluate_epoch(test_loader: DataLoader,
             recon_loss = model.module.masked_reconstruction_loss(
                 local_embeddings, time_series, mask
             )
-            anomaly_loss = model.module.anomaly_detection_loss(local_embeddings, labels)
+            if getattr(config, 'enable_multiscale_train', False):
+                anomaly_loss = _multiscale_anomaly_loss(
+                    model=model,
+                    masked_time_series=masked_time_series,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                    mask=mask,
+                    config=config,
+                )
+            else:
+                anomaly_loss = model.module.anomaly_detection_loss(local_embeddings, labels)
             
             total_loss_batch = recon_loss + anomaly_loss
             total_loss += total_loss_batch.item()
@@ -398,7 +500,17 @@ def train_epoch(train_loader: DataLoader,
                 recon_loss = model.module.masked_reconstruction_loss(
                     local_embeddings, time_series, mask
                 )
-                anomaly_loss = model.module.anomaly_detection_loss(local_embeddings, labels)
+                if getattr(config, 'enable_multiscale_train', False):
+                    anomaly_loss = _multiscale_anomaly_loss(
+                        model=model,
+                        masked_time_series=masked_time_series,
+                        labels=labels,
+                        attention_mask=attention_mask,
+                        mask=mask,
+                        config=config,
+                    )
+                else:
+                    anomaly_loss = model.module.anomaly_detection_loss(local_embeddings, labels)
             
             total_loss_batch = recon_loss + anomaly_loss
             scaler.scale(total_loss_batch).backward()
@@ -410,7 +522,17 @@ def train_epoch(train_loader: DataLoader,
             recon_loss = model.module.masked_reconstruction_loss(
                 local_embeddings, time_series, mask
             )
-            anomaly_loss = model.module.anomaly_detection_loss(local_embeddings, labels)
+            if getattr(config, 'enable_multiscale_train', False):
+                anomaly_loss = _multiscale_anomaly_loss(
+                    model=model,
+                    masked_time_series=masked_time_series,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                    mask=mask,
+                    config=config,
+                )
+            else:
+                anomaly_loss = model.module.anomaly_detection_loss(local_embeddings, labels)
             
             total_loss_batch = recon_loss + anomaly_loss
             total_loss_batch.backward()
