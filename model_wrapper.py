@@ -430,6 +430,10 @@ def run_Time_RCD(data,  **kwargs):
     random_mask = kwargs.get('random_mask', 'random_mask')
     size = kwargs.get('size', 'full')
     device = kwargs.get('device', '2')  # Extract device parameter
+    multi_scale = kwargs.get('multi_scale', False)
+    scales = tuple(kwargs.get('scales', (1, 2, 4)))
+    fusion = kwargs.get('fusion', 'mean')
+    downsample_method = kwargs.get('downsample_method', 'avg')
     """
     Wrapper function for Time_RCD model
     """
@@ -462,11 +466,19 @@ def run_Time_RCD(data,  **kwargs):
     config.ts_config.num_features = data.shape[1]
     print(f"Checkpoint path: {checkpoint_path}")
     cls = TimeRCDPretrainTester(checkpoint_path, config)
-    score_list, logit_list = cls.zero_shot(data)
+    if multi_scale:
+        score, logit, _ = cls.zero_shot_multiscale(
+            data,
+            scales=scales,
+            fusion=fusion,
+            downsample_method=downsample_method,
+        )
+    else:
+        score_list, logit_list = cls.zero_shot(data)
 
-    # Concatenate across batches robustly to avoid inhomogeneous shape errors
-    score = np.concatenate([np.asarray(s).reshape(-1) for s in score_list], axis=0)
-    logit = np.concatenate([np.asarray(l).reshape(-1) for l in logit_list], axis=0)
+        # Concatenate across batches robustly to avoid inhomogeneous shape errors
+        score = np.concatenate([np.asarray(s).reshape(-1) for s in score_list], axis=0)
+        logit = np.concatenate([np.asarray(l).reshape(-1) for l in logit_list], axis=0)
 
     return score, logit
 

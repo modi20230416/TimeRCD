@@ -368,11 +368,10 @@ class TimeRCDPretrainTester:
 
     def zero_shot(self, data):
         """Run zero-shot inference on the provided data."""
-        if len(data)  <= self.win_size:
-           self.win_size = len(data)
+        current_win_size = min(self.win_size, len(data))
 
         test_loader = DataLoader(
-            dataset=TimeRCDDataset(data, window_size=self.win_size, stride=self.win_size, normalize=True),
+            dataset=TimeRCDDataset(data, window_size=current_win_size, stride=current_win_size, normalize=True),
             batch_size=self.batch_size,
             collate_fn=test_collate_fn,
             num_workers=0,
@@ -409,6 +408,98 @@ class TimeRCDPretrainTester:
                 logit = anomaly_logits[..., 1] - anomaly_logits[..., 0]  # Anomaly logits (B, seq_len)
                 logits.append(logit.cpu().numpy())
         return scores, logits
+
+    @staticmethod
+    def _downsample_series(data: np.ndarray, scale: int, method: str = "avg") -> np.ndarray:
+        """Downsample a time series with simple and stable strategies."""
+        if scale <= 1:
+            return data
+
+        if method == "stride":
+            return data[::scale]
+
+        # default: average pooling over non-overlapping windows
+        trim_len = (len(data) // scale) * scale
+        if trim_len == 0:
+            return data
+        trimmed = data[:trim_len]
+        if trimmed.ndim == 1:
+            return trimmed.reshape(-1, scale).mean(axis=1)
+        return trimmed.reshape(-1, scale, trimmed.shape[1]).mean(axis=1)
+
+    @staticmethod
+    def _align_score_to_length(score: np.ndarray, target_len: int) -> np.ndarray:
+        """Align per-scale anomaly scores back to the original sequence length."""
+        score = np.asarray(score).reshape(-1)
+        if len(score) == target_len:
+            return score
+        if len(score) == 0:
+            return np.zeros(target_len, dtype=np.float32)
+        if len(score) == 1:
+            return np.repeat(score, target_len).astype(np.float32)
+
+        src_x = np.linspace(0, target_len - 1, num=len(score))
+        tgt_x = np.arange(target_len)
+        return np.interp(tgt_x, src_x, score).astype(np.float32)
+
+    def zero_shot_multiscale(
+            self,
+            data: np.ndarray,
+            scales=(1, 2, 4),
+            fusion: str = "mean",
+            downsample_method: str = "avg"):
+        """
+        Multi-scale zero-shot inference: independent per-scale scoring + score fusion.
+        """
+        if len(scales) == 0:
+            raise ValueError("scales must not be empty")
+
+        scales = tuple(int(scale) for scale in scales)
+        if any(scale <= 0 for scale in scales):
+            raise ValueError("all scales must be positive integers")
+
+        fusion = fusion.lower()
+        if fusion not in {"mean", "max"}:
+            raise ValueError("fusion must be either 'mean' or 'max'")
+
+        downsample_method = downsample_method.lower()
+        if downsample_method not in {"avg", "stride"}:
+            raise ValueError("downsample_method must be either 'avg' or 'stride'")
+
+        original_len = len(data)
+        per_scale_scores = []
+        per_scale_logits = []
+
+        for scale in scales:
+            scaled_data = self._downsample_series(data, scale=scale, method=downsample_method)
+            scores, logits = self.zero_shot(scaled_data)
+
+            score_flat = np.concatenate([np.asarray(s).reshape(-1) for s in scores], axis=0)
+            logit_flat = np.concatenate([np.asarray(l).reshape(-1) for l in logits], axis=0)
+
+            aligned_score = self._align_score_to_length(score_flat, original_len)
+            aligned_logit = self._align_score_to_length(logit_flat, original_len)
+
+            per_scale_scores.append(aligned_score)
+            per_scale_logits.append(aligned_logit)
+
+        score_stack = np.stack(per_scale_scores, axis=0)
+        logit_stack = np.stack(per_scale_logits, axis=0)
+
+        if fusion == "max":
+            fused_score = score_stack.max(axis=0)
+            fused_logit = logit_stack.max(axis=0)
+        else:
+            fused_score = score_stack.mean(axis=0)
+            fused_logit = logit_stack.mean(axis=0)
+
+        return fused_score, fused_logit, {
+            "scales": list(scales),
+            "fusion": fusion,
+            "downsample_method": downsample_method,
+            "per_scale_scores": per_scale_scores,
+            "per_scale_logits": per_scale_logits,
+        }
 
     def evaluate(self, time_series, mask):
         with torch.no_grad():

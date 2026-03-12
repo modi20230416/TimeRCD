@@ -74,6 +74,12 @@ class TimeRCDConfig:
     dist_port: str = "12355"     # Port for distributed training communication
     device: str = "cuda"
 
+    # Optional multi-scale training/validation settings
+    enable_multiscale_train: bool = False
+    multiscale_scales: tuple = (1, 2, 4)
+    multiscale_downsample_method: str = "avg"
+    multiscale_fusion: str = "mean"
+
     def to_dict(self) -> Dict[str, any]:
         return {
             "ts_config": self.ts_config.__dict__,
@@ -88,6 +94,10 @@ class TimeRCDConfig:
             "save_step_freq": self.save_step_freq,
             "model_prefix": self.model_prefix,
             "device": self.device,
+            "enable_multiscale_train": self.enable_multiscale_train,
+            "multiscale_scales": list(self.multiscale_scales),
+            "multiscale_downsample_method": self.multiscale_downsample_method,
+            "multiscale_fusion": self.multiscale_fusion,
         }
 
 default_config = TimeRCDConfig()
