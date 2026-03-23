@@ -28,6 +28,7 @@ class TimeSeriesConfig:
     activation: str = "gelu"
     num_features: int = 1
     test_batch_limit: int = 20
+    encoder_mode: str = "joint"
 
 
 @dataclass

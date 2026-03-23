@@ -15,7 +15,7 @@ from typing import Tuple, List, Dict, Any, Union, Optional
 from dataclasses import dataclass
 
 from .dataset import ChatTSTimeRCDPretrainDataset
-from .ts_encoder_bi_bias import TimeSeriesEncoder
+from .ts_encoder_bi_bias import TimeSeriesEncoder, SeparatedTemporalVariateEncoder
 from .time_rcd_config import TimeRCDConfig, default_config
 
 import warnings
@@ -40,17 +40,23 @@ class TimeSeriesPretrainModel(nn.Module):
 
         # Extract TimeSeriesEncoder parameters from config
         ts_config = config.ts_config
-        self.ts_encoder = TimeSeriesEncoder(
+        encoder_kwargs = dict(
             d_model=ts_config.d_model,
             d_proj=ts_config.d_proj,
             patch_size=ts_config.patch_size,
             num_layers=ts_config.num_layers,
             num_heads=ts_config.num_heads,
             d_ff_dropout=ts_config.d_ff_dropout,
-            use_rope=ts_config.use_rope,
             num_features=ts_config.num_features,
             activation=ts_config.activation
         )
+        if ts_config.encoder_mode == "separated_temporal_variate":
+            self.ts_encoder = SeparatedTemporalVariateEncoder(**encoder_kwargs)
+        else:
+            self.ts_encoder = TimeSeriesEncoder(
+                use_rope=ts_config.use_rope,
+                **encoder_kwargs
+            )
 
         # Masked reconstruction head
         self.reconstruction_head = nn.Sequential(

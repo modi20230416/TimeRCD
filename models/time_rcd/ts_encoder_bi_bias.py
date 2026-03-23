@@ -374,3 +374,104 @@ class TimeSeriesEncoder(nn.Module):
                            :]  # (B, seq_len, num_features, d_proj)
 
         return local_embeddings
+
+
+class SeparatedTemporalVariateEncoder(nn.Module):
+    """
+    Time series encoder that alternates temporal attention and variate attention.
+
+    This encoder removes binary attention bias and uses two independent Transformer
+    encoders at each stack depth:
+    1) Temporal encoder over patch sequence per variable.
+    2) Variate encoder over variables per patch timestep.
+    """
+
+    def __init__(self, d_model=2048, d_proj=512, patch_size=32, num_layers=6, num_heads=8,
+                 d_ff_dropout=0.1, num_features=1, activation="relu"):
+        super().__init__()
+        self.patch_size = patch_size
+        self.d_model = d_model
+        self.d_proj = d_proj
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.num_features = num_features
+
+        self.embedding_layer = nn.Linear(patch_size, d_model)
+
+        # Alternating temporal -> variate stacks.
+        self.temporal_layers = nn.ModuleList()
+        self.variate_layers = nn.ModuleList()
+        for _ in range(num_layers):
+            temporal_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=num_heads,
+                dim_feedforward=d_model * 4,
+                dropout=d_ff_dropout,
+                batch_first=True,
+                activation=activation
+            )
+            variate_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=num_heads,
+                dim_feedforward=d_model * 4,
+                dropout=d_ff_dropout,
+                batch_first=True,
+                activation=activation
+            )
+            self.temporal_layers.append(temporal_layer)
+            self.variate_layers.append(variate_layer)
+
+        self.projection_layer = nn.Linear(d_model, patch_size * d_proj)
+
+    def forward(self, time_series, mask):
+        if time_series.dim() == 2:
+            time_series = time_series.unsqueeze(-1)
+        B, seq_len, num_features = time_series.size()
+        assert num_features == self.num_features, (
+            f"Number of features mismatch with data: {num_features} vs param: {self.num_features}"
+        )
+        assert mask.size() == (B, seq_len), "Mask shape mismatch"
+
+        padded_length = math.ceil(seq_len / self.patch_size) * self.patch_size
+        if padded_length > seq_len:
+            pad_amount = padded_length - seq_len
+            time_series = F.pad(time_series, (0, 0, 0, pad_amount), value=0)
+            mask = F.pad(mask, (0, pad_amount), value=0)
+
+        num_patches = padded_length // self.patch_size
+        patches = time_series.view(B, num_patches, self.patch_size, num_features)
+        patches = patches.permute(0, 3, 1, 2).contiguous()  # (B, F, P, patch_size)
+
+        # Embed each variable patch independently.
+        token_embeddings = self.embedding_layer(patches)  # (B, F, P, d_model)
+
+        patch_mask = mask.view(B, num_patches, self.patch_size).sum(dim=-1) > 0  # (B, P)
+        temporal_padding_mask = (~patch_mask).unsqueeze(1).expand(-1, num_features, -1)
+        temporal_padding_mask = temporal_padding_mask.reshape(B * num_features, num_patches)
+
+        x = token_embeddings
+        for temporal_layer, variate_layer in zip(self.temporal_layers, self.variate_layers):
+            # Temporal attention per variable: (B*F, P, D)
+            x_temporal = x.reshape(B * num_features, num_patches, self.d_model)
+            x_temporal = temporal_layer(
+                x_temporal,
+                src_key_padding_mask=temporal_padding_mask
+            )
+            x = x_temporal.reshape(B, num_features, num_patches, self.d_model)
+
+            # Variate attention per patch: (B*P, F, D)
+            x_variate = x.permute(0, 2, 1, 3).reshape(B * num_patches, num_features, self.d_model)
+            variate_padding_mask = (~patch_mask).reshape(B * num_patches, 1).expand(-1, num_features)
+            x_variate = variate_layer(
+                x_variate,
+                src_key_padding_mask=variate_padding_mask
+            )
+            x = x_variate.reshape(B, num_patches, num_features, self.d_model).permute(0, 2, 1, 3)
+
+        patch_embeddings = x.reshape(B, num_features * num_patches, self.d_model)
+        patch_proj = self.projection_layer(patch_embeddings)
+        local_embeddings = patch_proj.view(B, num_features, num_patches, self.patch_size, self.d_proj)
+        local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4)
+        local_embeddings = local_embeddings.reshape(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
+
+        return local_embeddings
