@@ -182,7 +182,7 @@ class LlamaMLP(nn.Module):
 class TransformerEncoderLayerWithRoPE(nn.Module):
     """Transformer Encoder Layer with RoPE, RMSNorm and adaptive output gating."""
 
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu", num_features=1):
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu", num_features=1, enable_gating=True):
         super().__init__()
         self.self_attn = MultiheadAttentionWithRoPE(d_model, nhead, num_features)
         self.dropout = nn.Dropout(dropout)
@@ -192,8 +192,9 @@ class TransformerEncoderLayerWithRoPE(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.activation = F.relu if activation == "relu" else F.gelu
+        self.enable_gating = enable_gating
         # Per-layer learnable gate: H_out' = H_out ⊙ sigmoid(H_inp W_theta)
-        self.gate_proj = nn.Linear(d_model, d_model, bias=True)
+        self.gate_proj = nn.Linear(d_model, d_model, bias=True) if enable_gating else None
 
     def forward(self, src, freqs, src_id=None, attn_mask=None):
         layer_input = src
@@ -208,15 +209,16 @@ class TransformerEncoderLayerWithRoPE(nn.Module):
         src = self.mlp(src)
         src = residual + self.dropout2(src)
 
-        gate = torch.sigmoid(self.gate_proj(layer_input))
-        src = src * gate
+        if self.enable_gating:
+            gate = torch.sigmoid(self.gate_proj(layer_input))
+            src = src * gate
         return src
 
 
 class CustomTransformerEncoder(nn.Module):
     """Stack of Transformer Encoder Layers."""
 
-    def __init__(self, d_model, nhead, dim_feedforward, dropout, activation, num_layers, num_features):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout, activation, num_layers, num_features, enable_gating=True):
         super().__init__()
         self.layers = nn.ModuleList([
             TransformerEncoderLayerWithRoPE(
@@ -225,7 +227,8 @@ class CustomTransformerEncoder(nn.Module):
                 dim_feedforward=dim_feedforward,
                 dropout=dropout,
                 activation=activation,
-                num_features=num_features
+                num_features=num_features,
+                enable_gating=enable_gating
             ) for _ in range(num_layers)
         ])
 
@@ -262,7 +265,7 @@ class TimeSeriesEncoder(nn.Module):
 
     def __init__(self, d_model=2048, d_proj=512, patch_size=32, num_layers=6, num_heads=8,
                  d_ff_dropout=0.1, max_total_tokens=8192, use_rope=True, num_features=1,
-                 activation="relu"):
+                 activation="relu", enable_gating=True):
         super().__init__()
         self.patch_size = patch_size
         self.d_model = d_model
@@ -274,6 +277,7 @@ class TimeSeriesEncoder(nn.Module):
         self.use_rope = use_rope
         self.num_features = num_features
         self.activation = activation
+        self.enable_gating = enable_gating
 
         # Patch embedding layer
         self.embedding_layer = nn.Linear(patch_size, d_model)
@@ -288,7 +292,8 @@ class TimeSeriesEncoder(nn.Module):
                 dropout=d_ff_dropout,
                 activation=activation,
                 num_layers=num_layers,
-                num_features=num_features
+                num_features=num_features,
+                enable_gating=enable_gating
             )
         else:
             # Standard encoder without RoPE

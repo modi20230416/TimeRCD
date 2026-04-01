@@ -97,3 +97,28 @@ return src
   - Baseline（无门控）
   - Gate on Attention output
   - Gate on Block output（当前方案）
+
+
+---
+
+## 7. 如何启用 Gating（实操）
+
+默认已启用：
+
+```python
+from models.time_rcd.time_rcd_config import TimeRCDConfig
+
+config = TimeRCDConfig()
+config.ts_config.enable_gating = True  # 开启门控（默认）
+```
+
+如需关闭做消融：
+
+```python
+config.ts_config.enable_gating = False
+```
+
+当前实现位置：
+- 配置项：`models/time_rcd/time_rcd_config.py` 中 `TimeSeriesConfig.enable_gating`
+- 传参路径：`training.py` / `TimeRCD_pretrain_multi.py` / `full_reconstruction.py`
+- 生效层：`TransformerEncoderLayerWithRoPE`（TimeRCD 自定义 RoPE 编码器路径）

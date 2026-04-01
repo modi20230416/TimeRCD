@@ -16,6 +16,7 @@ class TimeSeriesConfig:
         use_rope: Whether to use Rotary Position Embedding.
         activation: Activation function name.
         num_features: Number of input features.
+        enable_gating: Whether to enable per-layer output gating.
     """
     d_model: int = 512
     d_proj: int = 256
@@ -27,6 +28,7 @@ class TimeSeriesConfig:
     use_rope: bool = True
     activation: str = "gelu"
     num_features: int = 1
+    enable_gating: bool = True
     test_batch_limit: int = 20
 
 

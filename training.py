@@ -90,7 +90,8 @@ class TimeSeriesPretrainModel(nn.Module):
             d_ff_dropout=ts_config.d_ff_dropout,
             use_rope=ts_config.use_rope,
             num_features=ts_config.num_features,
-            activation=ts_config.activation
+            activation=ts_config.activation,
+            enable_gating=ts_config.enable_gating
         )
         
         # Masked reconstruction head
