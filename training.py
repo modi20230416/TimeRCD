@@ -166,18 +166,19 @@ class TimeSeriesPretrainModel(nn.Module):
         batch_size, seq_len, _ = logits.shape
         logits = logits.view(-1, 2)  # (B*seq_len, 2)
         labels = labels.view(-1)  # (B*seq_len)
-        labels = (labels > 0.5).long()
-        # Create mask for valid labels (not padding)
+        # Create mask for valid labels (not padding). NOTE: must be computed before binarization.
         valid_mask = (labels != -1)
-        
+        labels = (labels > 0.5).long()
+
         # Compute loss only on valid timesteps
-        if valid_mask.sum() > 0:
+        if valid_mask.any():
             anomaly_loss = F.cross_entropy(
                 logits[valid_mask],
                 labels[valid_mask]
             )
         else:
-            anomaly_loss = torch.tensor(0.0, device=logits.device)
+            # Keep graph connected to logits for DDP consistency when a rank has no valid labels.
+            anomaly_loss = logits.sum() * 0.0
             
         return anomaly_loss
 
@@ -621,8 +622,7 @@ def train_worker(rank: int, world_size: int, config: TimeRCDConfig, filename: st
                 print(f"Successfully loaded model weights from previous dataset training")
         
         # Wrap model with DDP
-        # model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-        model = DDP(model, device_ids=[rank])
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
         
         # Setup optimizer
         optimizer = optim.AdamW(
