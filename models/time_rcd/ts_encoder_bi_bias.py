@@ -192,9 +192,8 @@ class TransformerEncoderLayerWithRoPE(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.activation = F.relu if activation == "relu" else F.gelu
-        self.enable_gating = enable_gating
         # Per-layer learnable gate: H_out' = H_out ⊙ sigmoid(H_inp W_theta)
-        self.gate_proj = nn.Linear(d_model, d_model, bias=True) if enable_gating else None
+        self.gate_proj = nn.Linear(d_model, d_model, bias=True)
 
     def forward(self, src, freqs, src_id=None, attn_mask=None):
         layer_input = src
@@ -209,9 +208,8 @@ class TransformerEncoderLayerWithRoPE(nn.Module):
         src = self.mlp(src)
         src = residual + self.dropout2(src)
 
-        if self.enable_gating:
-            gate = torch.sigmoid(self.gate_proj(layer_input))
-            src = src * gate
+        gate = torch.sigmoid(self.gate_proj(layer_input))
+        src = src * gate
         return src
 
 
