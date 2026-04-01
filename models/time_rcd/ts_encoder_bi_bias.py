@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Optional
 from jaxtyping import Float, Int
 from einops import rearrange
 
@@ -228,6 +229,104 @@ class CustomTransformerEncoder(nn.Module):
         return output
 
 
+class LightweightMambaBlock(nn.Module):
+    """A lightweight Mamba-style sequence mixer built with gated local/global mixing."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.norm = RMSNorm(d_model)
+        self.in_proj = nn.Linear(d_model, 2 * d_model)
+        self.dw_conv = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=3,
+            padding=1,
+            groups=d_model,
+        )
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, seq_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        residual = x
+        h = self.norm(x)
+        gate, value = self.in_proj(h).chunk(2, dim=-1)
+
+        # Local sequential mixing (depth-wise temporal convolution).
+        value_local = self.dw_conv(value.transpose(1, 2)).transpose(1, 2)
+
+        # Global state summary as a lightweight recurrent-style proxy.
+        if seq_mask is not None:
+            mask = seq_mask.unsqueeze(-1).to(value_local.dtype)
+            denom = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+            global_state = (value_local * mask).sum(dim=1, keepdim=True) / denom
+        else:
+            global_state = value_local.mean(dim=1, keepdim=True)
+        value_mixed = value_local + global_state
+
+        y = torch.sigmoid(gate) * value_mixed
+        y = self.out_proj(y)
+        y = self.dropout(y)
+        return residual + y
+
+
+class DualStreamMambaEncoder(nn.Module):
+    """Two-stream Mamba encoder with intra-variable and inter-variable paths plus learned fusion."""
+
+    def __init__(self, d_model: int, num_layers: int, dropout: float = 0.1):
+        super().__init__()
+        self.intra_layers = nn.ModuleList([
+            LightweightMambaBlock(d_model=d_model, dropout=dropout) for _ in range(num_layers)
+        ])
+        self.inter_layers = nn.ModuleList([
+            LightweightMambaBlock(d_model=d_model, dropout=dropout) for _ in range(num_layers)
+        ])
+        self.fusion_gate = nn.Sequential(
+            RMSNorm(2 * d_model),
+            nn.Linear(2 * d_model, d_model),
+            nn.Sigmoid(),
+        )
+
+    def _apply_feature_wise_stream(
+            self,
+            x: torch.Tensor,
+            num_features: int,
+            num_patches: int,
+            attn_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        # x: (B, L, D), where L = num_features * num_patches
+        B, _, D = x.shape
+        intra = x.view(B, num_features, num_patches, D).reshape(B * num_features, num_patches, D)
+
+        if attn_mask is not None:
+            intra_mask = attn_mask.view(B, num_features, num_patches).reshape(B * num_features, num_patches)
+        else:
+            intra_mask = None
+
+        for layer in self.intra_layers:
+            intra = layer(intra, seq_mask=intra_mask)
+
+        intra = intra.view(B, num_features, num_patches, D).reshape(B, num_features * num_patches, D)
+        return intra
+
+    def _apply_cross_feature_stream(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        inter = x
+        for layer in self.inter_layers:
+            inter = layer(inter, seq_mask=attn_mask)
+        return inter
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            num_features: int,
+            num_patches: int,
+            attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        h_intra = self._apply_feature_wise_stream(x, num_features, num_patches, attn_mask)
+        h_inter = self._apply_cross_feature_stream(x, attn_mask)
+        gate = self.fusion_gate(torch.cat([h_intra, h_inter], dim=-1))
+        return gate * h_intra + (1.0 - gate) * h_inter
+
+
 class TimeSeriesEncoder(nn.Module):
     """
     Time Series Encoder with PatchTST-like patching, RoPE.
@@ -254,7 +353,7 @@ class TimeSeriesEncoder(nn.Module):
 
     def __init__(self, d_model=2048, d_proj=512, patch_size=32, num_layers=6, num_heads=8,
                  d_ff_dropout=0.1, max_total_tokens=8192, use_rope=True, num_features=1,
-                 activation="relu"):
+                 activation="relu", encoder_type: str = "transformer"):
         super().__init__()
         self.patch_size = patch_size
         self.d_model = d_model
@@ -266,33 +365,49 @@ class TimeSeriesEncoder(nn.Module):
         self.use_rope = use_rope
         self.num_features = num_features
         self.activation = activation
+        self.encoder_type = encoder_type.lower()
+        if self.encoder_type not in {"transformer", "mamba"}:
+            raise ValueError(f"Unsupported encoder_type: {encoder_type}. Choose from ['transformer', 'mamba'].")
 
         # Patch embedding layer
         self.embedding_layer = nn.Linear(patch_size, d_model)
 
-        if use_rope:
-            # Initialize RoPE and custom encoder
-            self.rope_embedder = RotaryEmbedding(d_model)
-            self.transformer_encoder = CustomTransformerEncoder(
+        if self.encoder_type == "mamba":
+            # Mamba stream naturally models sequence order, so no RoPE.
+            self.use_rope = False
+            self.rope_embedder = None
+            self.transformer_encoder = None
+            self.mamba_encoder = DualStreamMambaEncoder(
                 d_model=d_model,
-                nhead=num_heads,
-                dim_feedforward=d_model * 4,
-                dropout=d_ff_dropout,
-                activation=activation,
                 num_layers=num_layers,
-                num_features=num_features
+                dropout=d_ff_dropout,
             )
         else:
-            # Standard encoder without RoPE
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=d_model,
-                nhead=num_heads,
-                dim_feedforward=d_model * 4,
-                dropout=d_ff_dropout,
-                batch_first=True,
-                activation=activation
-            )
-            self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+            self.mamba_encoder = None
+            if use_rope:
+                # Initialize RoPE and custom encoder
+                self.rope_embedder = RotaryEmbedding(d_model)
+                self.transformer_encoder = CustomTransformerEncoder(
+                    d_model=d_model,
+                    nhead=num_heads,
+                    dim_feedforward=d_model * 4,
+                    dropout=d_ff_dropout,
+                    activation=activation,
+                    num_layers=num_layers,
+                    num_features=num_features
+                )
+            else:
+                # Standard encoder without RoPE
+                self.rope_embedder = None
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=d_model,
+                    nhead=num_heads,
+                    dim_feedforward=d_model * 4,
+                    dropout=d_ff_dropout,
+                    batch_first=True,
+                    activation=activation
+                )
+                self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
         # Output projection layers
         self.projection_layer = nn.Linear(d_model, patch_size * d_proj)
@@ -345,25 +460,33 @@ class TimeSeriesEncoder(nn.Module):
         full_mask = full_mask.reshape(B, num_features * num_patches)  # (B, L)
 
         # Generate RoPE frequencies if applicable
-        if self.use_rope:
+        if self.encoder_type == "transformer" and self.use_rope:
             freqs = self.rope_embedder(total_length).to(device)
         else:
             freqs = None
 
         # Encode sequence
-        if num_features > 1:
-            output = self.transformer_encoder(
+        if self.encoder_type == "mamba":
+            output = self.mamba_encoder(
                 embedded_patches,
-                freqs=freqs,
-                src_id=feature_id,
+                num_features=num_features,
+                num_patches=num_patches,
                 attn_mask=full_mask
             )
         else:
-            output = self.transformer_encoder(
-                embedded_patches,
-                freqs=freqs,
-                attn_mask=full_mask
-            )
+            if num_features > 1:
+                output = self.transformer_encoder(
+                    embedded_patches,
+                    freqs=freqs,
+                    src_id=feature_id,
+                    attn_mask=full_mask
+                )
+            else:
+                output = self.transformer_encoder(
+                    embedded_patches,
+                    freqs=freqs,
+                    attn_mask=full_mask
+                )
 
         # Extract and project local embeddings
         patch_embeddings = output  # (B, L, d_model)
