@@ -180,7 +180,7 @@ class LlamaMLP(nn.Module):
 
 
 class TransformerEncoderLayerWithRoPE(nn.Module):
-    """Transformer Encoder Layer with RoPE and RMSNorm."""
+    """Transformer Encoder Layer with RoPE, RMSNorm and adaptive output gating."""
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu", num_features=1):
         super().__init__()
@@ -192,16 +192,24 @@ class TransformerEncoderLayerWithRoPE(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.activation = F.relu if activation == "relu" else F.gelu
+        # Per-layer learnable gate: H_out' = H_out ⊙ sigmoid(H_inp W_theta)
+        self.gate_proj = nn.Linear(d_model, d_model, bias=True)
 
     def forward(self, src, freqs, src_id=None, attn_mask=None):
+        layer_input = src
+
         residual = src
         src = self.input_norm(src)
         src = self.self_attn(src, src, src, freqs, src_id, src_id, attn_mask=attn_mask)
         src = src + residual
+
         residual = src
         src = self.output_norm(src)
         src = self.mlp(src)
         src = residual + self.dropout2(src)
+
+        gate = torch.sigmoid(self.gate_proj(layer_input))
+        src = src * gate
         return src
 
 

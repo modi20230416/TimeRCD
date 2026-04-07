@@ -314,6 +314,13 @@ def cleanup_distributed() -> None:
         dist.destroy_process_group()
 
 
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """Return underlying model when wrapped by DDP."""
+    return model.module if hasattr(model, 'module') else model
+
+
 def evaluate_epoch(test_loader: DataLoader,
                   model: nn.Module,
                   config: TimeRCDConfig,
@@ -321,6 +328,7 @@ def evaluate_epoch(test_loader: DataLoader,
                   rank: int) -> float:
     """Evaluate model on test dataset."""
     model.eval()
+    base_model = unwrap_model(model)
     total_loss = 0.0
     total_recon_loss = 0.0
     total_anomaly_loss = 0.0
@@ -339,10 +347,10 @@ def evaluate_epoch(test_loader: DataLoader,
             local_embeddings = model(masked_time_series, attention_mask & (~mask.bool()))
                 
             # Compute losses
-            recon_loss = model.module.masked_reconstruction_loss(
+            recon_loss = base_model.masked_reconstruction_loss(
                 local_embeddings, time_series, mask
             )
-            anomaly_loss = model.module.anomaly_detection_loss(local_embeddings, labels)
+            anomaly_loss = base_model.anomaly_detection_loss(local_embeddings, labels)
             
             total_loss_batch = recon_loss + anomaly_loss
             total_loss += total_loss_batch.item()
@@ -373,6 +381,7 @@ def train_epoch(train_loader: DataLoader,
                 scaler: Optional[torch.cuda.amp.GradScaler] = None) -> float:
     """Train for one epoch with multiple pretraining tasks."""
     model.train()
+    base_model = unwrap_model(model)
     total_loss = 0.0
     total_recon_loss = 0.0
     total_anomaly_loss = 0.0
@@ -395,10 +404,10 @@ def train_epoch(train_loader: DataLoader,
             with torch.amp.autocast('cuda'):
                 local_embeddings = model(masked_time_series, attention_mask & (~mask.bool()))
                 
-                recon_loss = model.module.masked_reconstruction_loss(
+                recon_loss = base_model.masked_reconstruction_loss(
                     local_embeddings, time_series, mask
                 )
-                anomaly_loss = model.module.anomaly_detection_loss(local_embeddings, labels)
+                anomaly_loss = base_model.anomaly_detection_loss(local_embeddings, labels)
             
             total_loss_batch = recon_loss + anomaly_loss
             scaler.scale(total_loss_batch).backward()
@@ -407,10 +416,10 @@ def train_epoch(train_loader: DataLoader,
         else:
             local_embeddings = model(masked_time_series, attention_mask & (~mask.bool()))
                 
-            recon_loss = model.module.masked_reconstruction_loss(
+            recon_loss = base_model.masked_reconstruction_loss(
                 local_embeddings, time_series, mask
             )
-            anomaly_loss = model.module.anomaly_detection_loss(local_embeddings, labels)
+            anomaly_loss = base_model.anomaly_detection_loss(local_embeddings, labels)
             
             total_loss_batch = recon_loss + anomaly_loss
             total_loss_batch.backward()
@@ -454,10 +463,8 @@ def save_checkpoint(model: nn.Module,
         return
     
     # Extract model state dict (handle DDP wrapper)
-    if hasattr(model, 'module'):
-        model_state_dict = model.module.state_dict()
-    else:
-        model_state_dict = model.state_dict()
+    base_model = unwrap_model(model)
+    model_state_dict = base_model.state_dict()
     
     checkpoint = {
         'epoch': epoch,
@@ -486,10 +493,7 @@ def save_checkpoint(model: nn.Module,
         print(f"New best model saved to {best_path} (epoch {epoch}, val_loss: {avg_loss:.4f})")
 
         # Save just the time series encoder for downstream tasks
-        if hasattr(model, 'module'):
-            ts_encoder_state = model.module.ts_encoder.state_dict()
-        else:
-            ts_encoder_state = model.ts_encoder.state_dict()
+        ts_encoder_state = base_model.ts_encoder.state_dict()
         
         best_encoder_path = os.path.join(config.checkpoint_dir, "pretrained_ts_encoder.pth")
         torch.save(ts_encoder_state, best_encoder_path)
@@ -512,8 +516,8 @@ def train_multiple_datasets(dataset_filenames: List[str], config: TimeRCDConfig)
     # Set CUDA_VISIBLE_DEVICES
     os.environ['CUDA_VISIBLE_DEVICES'] = config.cuda_devices
     
-    # Global checkpoint path for model continuation
-    global_checkpoint_path = None
+    # Global checkpoint path for model continuation (supports manual resume)
+    global_checkpoint_path = getattr(config, "continuation_checkpoint", None)
     # global_checkpoint_path = "experiments/checkpoints/pretrain_multi_activate_big/dataset_8_12.pkl/pretrain_checkpoint_best.pth"
     
     for dataset_idx, filename in enumerate(dataset_filenames):
@@ -619,9 +623,9 @@ def train_worker(rank: int, world_size: int, config: TimeRCDConfig, filename: st
             if rank == 0:
                 print(f"Successfully loaded model weights from previous dataset training")
         
-        # Wrap model with DDP
-        # model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-        model = DDP(model, device_ids=[rank])
+        # Wrap model with DDP only when using multiple processes
+        if world_size > 1:
+            model = DDP(model, device_ids=[rank])
         
         # Setup optimizer
         optimizer = optim.AdamW(
@@ -762,7 +766,16 @@ def main() -> None:
     # Change to True for multi-dataset training
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='multi', choices=['multi', 'single'])
+    parser.add_argument('--resume_checkpoint', type=str, default='',
+                        help='Path to checkpoint (.pth) for resuming interrupted training')
     args = parser.parse_args()
+    if args.resume_checkpoint:
+        if os.path.exists(args.resume_checkpoint):
+            config.continuation_checkpoint = args.resume_checkpoint
+            print(f"Resume checkpoint set to: {args.resume_checkpoint}")
+        else:
+            raise FileNotFoundError(f"Resume checkpoint not found: {args.resume_checkpoint}")
+
     # Change to True for single-dataset training
     if args.mode == 'multi':
         use_multi_dataset_training = True
